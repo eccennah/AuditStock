@@ -1,4 +1,4 @@
-;; AuditStock Contract
+;; StockProof Contract
 ;; A simple system to track products and sales
 
 ;; owner of this contract
@@ -11,10 +11,17 @@
 (define-constant err-order-not-found (err u4))
 (define-constant err-already-finalized (err u5))
 (define-constant err-invalid-quantity (err u6))
+(define-constant err-empty-batch (err u7))
+(define-constant err-batch-not-found (err u8))
+(define-constant err-batch-already-finalized (err u9))
+(define-constant max-batch-items u20)  ;; Max 20 items per batch
 
 ;; counter to give each product a unique ID
 (define-data-var next-product-id uint u1)
 (define-data-var next-order-id uint u1)
+;; Counter for batch orders
+(define-data-var next-batch-id uint u1)
+
 
 ;; Store all products
 ;; Maps work like: key -> value
@@ -39,6 +46,25 @@
     finalized: bool
   }
 )
+;; Store batch order header
+(define-map batch-orders
+  uint  ;; batch-id
+  {
+    cashier: principal,
+    timestamp: uint,
+    finalized: bool,
+    total-items: uint
+  }
+)
+;; Store individual items in the batch
+(define-map batch-items
+  {batch-id: uint, item-index: uint}  ;; Composite key
+  {
+    product-id: uint,
+    quantity: uint
+  }
+)
+
 
 ;; track who is admin and cashier
 (define-map admins principal bool)
@@ -55,15 +81,20 @@
 (define-read-only (is-cashier (user principal))
   (default-to false (map-get? cashiers user))
 )
-
 ;; Get product details
 (define-read-only (get-product (product-id uint))
   (map-get? products product-id)
 )
-
 ;; Get order details
 (define-read-only (get-order (order-id uint))
   (map-get? orders order-id)
+)
+;; Get batch order details
+(define-read-only (get-batch-order (batch-id uint))
+  (map-get? batch-orders batch-id)
+)
+(define-read-only (get-batch-item (batch-id uint) (item-index uint))
+  (map-get? batch-items {batch-id: batch-id, item-index: item-index})
 )
 
 ;; Register a Product (Admin Only)
@@ -217,5 +248,149 @@
     })
     
     (ok true)
+  )
+)
+
+
+;; Check if all items in batch have enough stock
+(define-private (check-batch-stock (items (list 20 {product-id: uint, quantity: uint})))
+  (fold check-single-item-stock items true)
+)
+
+(define-private (check-single-item-stock 
+  (item {product-id: uint, quantity: uint})
+  (prev-result bool))
+  (match (map-get? products (get product-id item))
+    product
+      (and prev-result 
+           (>= (get stock product) (get quantity item))
+           (> (get quantity item) u0))
+    false
+  )
+)
+
+;; Store all items in batch
+(define-private (store-batch-items 
+  (batch-id uint)
+  (items (list 20 {product-id: uint, quantity: uint}))
+  (start-index uint))
+  (fold store-single-item items start-index)
+)
+
+(define-private (store-single-item
+  (item {product-id: uint, quantity: uint})
+  (index uint))
+  (begin
+    (map-set batch-items
+      {batch-id: (var-get next-batch-id), item-index: index}
+      {
+        product-id: (get product-id item),
+        quantity: (get quantity item)
+      }
+    )
+    (+ index u1)
+  )
+)
+
+
+;; Create a batch order with multiple products
+(define-public (create-batch-order (items (list 20 {product-id: uint, quantity: uint})))
+  (let
+    (
+      (batch-id (var-get next-batch-id))
+      (items-count (len items))
+    )
+    ;; Only cashiers can create batch orders
+    (asserts! (is-cashier tx-sender) err-not-authorized)
+    
+    ;; Batch must not be empty
+    (asserts! (> items-count u0) err-empty-batch)
+    
+    ;; Check all items have valid stock before creating batch
+    (asserts! (check-batch-stock items) err-not-enough-stock)
+    
+    ;; Create batch header
+    (map-set batch-orders batch-id {
+      cashier: tx-sender,
+      timestamp: block-height,
+      finalized: false,
+      total-items: items-count
+    })
+    
+    ;; Store each item in the batch
+    (store-batch-items batch-id items u0)
+    
+    ;; Increment batch ID
+    (var-set next-batch-id (+ batch-id u1))
+    
+    ;; Print event
+    (print {
+      event: "batch-created",
+      batch-id: batch-id,
+      total-items: items-count,
+      cashier: tx-sender
+    })
+    
+    (ok batch-id)
+  )
+)
+
+;; Finalize batch order - decreases stock for ALL items
+(define-public (finalize-batch-order (batch-id uint))
+  (let
+    (
+      (batch (unwrap! (map-get? batch-orders batch-id) err-batch-not-found))
+    )
+    ;; Only cashiers can finalize
+    (asserts! (is-cashier tx-sender) err-not-authorized)
+    
+    ;; Batch must not be finalized already
+    (asserts! (is-eq (get finalized batch) false) err-batch-already-finalized)
+    
+    ;; Process all items (decrease stock for each)
+    (unwrap! (process-batch-items batch-id (get total-items batch)) err-not-enough-stock)
+    
+    ;; Mark batch as finalized
+    (map-set batch-orders batch-id 
+      (merge batch {finalized: true})
+    )
+    
+    ;; Print event
+    (print {
+      event: "batch-finalized",
+      batch-id: batch-id,
+      total-items: (get total-items batch),
+      cashier: tx-sender
+    })
+    
+    (ok true)
+  )
+)
+
+;; Process all items in batch
+(define-private (process-batch-items (batch-id uint) (total-items uint))
+  (process-items-recursive batch-id u0 total-items)
+)
+
+(define-private (process-items-recursive (batch-id uint) (current-index uint) (max-index uint))
+  (if (>= current-index max-index)
+    (ok true)
+    (let
+      (
+        (item (unwrap! (map-get? batch-items {batch-id: batch-id, item-index: current-index}) err-batch-not-found))
+        (product (unwrap! (map-get? products (get product-id item)) err-product-not-found))
+        (new-stock (- (get stock product) (get quantity item)))
+      )
+      ;; Check stock still available
+      (asserts! (>= (get stock product) (get quantity item)) err-not-enough-stock)
+      
+      ;; Decrease stock
+      (map-set products (get product-id item)
+        (merge product {stock: new-stock})
+      )
+      
+      ;; Process next item
+      (process-items-recursive batch-id (+ current-index u1) max-index)
+    )
   )
 )
