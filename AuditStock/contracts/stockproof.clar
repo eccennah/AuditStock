@@ -66,20 +66,16 @@
 )
 
 
-;; track who is admin and cashier
-(define-map admins principal bool)
-(define-map cashiers principal bool)
-
-;; Make the contract owner an admin automatically
-(map-set admins contract-owner true)
+;; track who is admin and cashier (DELEGATED to access-manager)
 
 ;; Read-only function 
 (define-read-only (is-admin (user principal))
-  (default-to false (map-get? admins user))
+  (contract-call? .access-manager is-admin user)
 )
+
 ;; Check if someone is a cashier
 (define-read-only (is-cashier (user principal))
-  (default-to false (map-get? cashiers user))
+  (contract-call? .access-manager is-cashier user)
 )
 ;; Get product details
 (define-read-only (get-product (product-id uint))
@@ -155,17 +151,7 @@
   )
 )
 
-;; Add a cashier
-(define-public (add-cashier (new-cashier principal))
-  (begin
-    ;; Only admins can add cashiers
-    (asserts! (is-admin tx-sender) err-not-authorized)
-    
-    (map-set cashiers new-cashier true)
-    
-    (ok true)
-  )
-)
+;; Note: add-cashier has been moved to access-manager.clar
 
 
 ;; ===================================
@@ -191,7 +177,7 @@
       product-id: product-id,
       quantity: quantity,
       cashier: tx-sender,
-      timestamp: block-height,
+      timestamp: burn-block-height,
       finalized: false
     })
     
@@ -312,7 +298,7 @@
     ;; Create batch header
     (map-set batch-orders batch-id {
       cashier: tx-sender,
-      timestamp: block-height,
+      timestamp: burn-block-height,
       finalized: false,
       total-items: items-count
     })
@@ -348,7 +334,8 @@
     (asserts! (is-eq (get finalized batch) false) err-batch-already-finalized)
     
     ;; Process all items (decrease stock for each)
-    (unwrap! (process-batch-items batch-id (get total-items batch)) err-not-enough-stock)
+    (var-set current-processing-batch-id batch-id)
+    (asserts! (is-ok (process-batch-items (get total-items batch))) err-not-enough-stock)
     
     ;; Mark batch as finalized
     (map-set batch-orders batch-id 
@@ -367,30 +354,40 @@
   )
 )
 
-;; Process all items in batch
-(define-private (process-batch-items (batch-id uint) (total-items uint))
-  (process-items-recursive batch-id u0 total-items)
+(define-data-var current-processing-batch-id uint u0)
+
+;; Process all items in batch using fold to avoid circular dependencies
+(define-private (process-batch-items (total-items uint))
+  (fold process-single-batch-item 
+    (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19)
+    (ok true))
 )
 
-(define-private (process-items-recursive (batch-id uint) (current-index uint) (max-index uint))
-  (if (>= current-index max-index)
-    (ok true)
+(define-private (process-single-batch-item (index uint) (previous-result (response bool uint)))
+  (if (is-err previous-result)
+    previous-result
     (let
       (
-        (item (unwrap! (map-get? batch-items {batch-id: batch-id, item-index: current-index}) err-batch-not-found))
-        (product (unwrap! (map-get? products (get product-id item)) err-product-not-found))
-        (new-stock (- (get stock product) (get quantity item)))
+        (batch-id (var-get current-processing-batch-id))
+        (batch (unwrap! (map-get? batch-orders batch-id) (err u8)))
       )
-      ;; Check stock still available
-      (asserts! (>= (get stock product) (get quantity item)) err-not-enough-stock)
-      
-      ;; Decrease stock
-      (map-set products (get product-id item)
-        (merge product {stock: new-stock})
+      (if (< index (get total-items batch))
+        (let
+          (
+            (item (unwrap! (map-get? batch-items {batch-id: batch-id, item-index: index}) (err u8)))
+            (product (unwrap! (map-get? products (get product-id item)) (err u2)))
+            (new-stock (- (get stock product) (get quantity item)))
+          )
+          (if (>= (get stock product) (get quantity item))
+            (begin
+              (map-set products (get product-id item) (merge product {stock: new-stock}))
+              (ok true)
+            )
+            (err u3)
+          )
+        )
+        (ok true) ;; Index out of range for this batch, skip
       )
-      
-      ;; Process next item
-      (process-items-recursive batch-id (+ current-index u1) max-index)
     )
   )
 )
